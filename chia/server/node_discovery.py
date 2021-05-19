@@ -64,7 +64,8 @@ class FullNodeDiscovery:
         self.cleanup_task: Optional[asyncio.Task] = None
         self.initial_wait: int = 0
         self.resolver = dns.asyncresolver.Resolver()
-        self.pending_outbound_connections: Set = set()
+        self.pending_outbound_connections: Set[str] = set()
+        self.pending_tasks: Set[asyncio.Task] = set()
 
     async def initialize_address_manager(self) -> None:
         mkdir(self.peer_db_path.parent)
@@ -194,8 +195,6 @@ class FullNodeDiscovery:
     async def start_client_async(self, addr: PeerInfo, is_feeler: bool) -> None:
         try:
             if self.address_manager is None:
-                return
-            if addr.host in self.pending_outbound_connections:
                 return
             self.pending_outbound_connections.add(addr.host)
             client_connected = await self.server.start_client(
@@ -370,12 +369,18 @@ class FullNodeDiscovery:
                 # Special case: try to find our first peer much quicker.
                 if len(groups) == 0:
                     sleep_interval = 0.1
-                if addr is not None and initiate_connection:
-                    while len(self.pending_outbound_connections) >= MAX_CONCURRENT_OUTBOUND_CONNECTIONS:
-                        self.log.debug(f"Max concurrent outbound connections reached. Retrying in {sleep_interval}s.")
-                        await asyncio.sleep(sleep_interval)
-                    asyncio.create_task(self.start_client_async(addr, disconnect_after_handshake))
+                if addr is not None and initiate_connection and addr.host not in self.pending_outbound_connections:
+                    if len(self.pending_outbound_connections) >= MAX_CONCURRENT_OUTBOUND_CONNECTIONS:
+                        self.log.debug("Max concurrent outbound connections reached. waiting")
+                        await asyncio.wait(self.pending_tasks, return_when=asyncio.FIRST_COMPLETED)
+                    self.pending_tasks.add(
+                        asyncio.create_task(self.start_client_async(addr, disconnect_after_handshake))
+                    )
                 await asyncio.sleep(sleep_interval)
+
+                # prune completed connect tasks
+                self.pending_task = set(filter(lambda t: not t.done(), self.pending_tasks))
+
             except Exception as e:
                 self.log.error(f"Exception in create outbound connections: {e}")
                 self.log.error(f"Traceback: {traceback.format_exc()}")
@@ -487,8 +492,8 @@ class FullNodePeers(FullNodeDiscovery):
 
     async def close(self):
         await self._close_common()
-        self.self_advertise_task.cancel()
-        self.address_relay_task.cancel()
+        self.cancel_task_safe(self.self_advertise_task)
+        self.cacnel_task_safe(self.address_relay_task)
 
     async def _periodically_self_advertise_and_clean_data(self):
         while not self.is_closed:
